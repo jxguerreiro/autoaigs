@@ -1,0 +1,8 @@
+{
+  "intro_video": "output_split/1_intro_muted.mp4",
+  "outro_video": "output_split/1_outro_muted.mp4",
+  "padded_audio": "output_split/1_padded.mp3",
+  "padded_srt": "output_split/1_padded.srt",
+  "outro_start": 68.44,
+  "last_sentence": " Follow for more real vet tips that keep your dog healthy and strong."
+}
