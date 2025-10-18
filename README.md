@@ -8,13 +8,14 @@
 4. Health tip
 5. (REPEAT health-tip pattern 2-4x)
 6. Target heatlh issue (Pre-CTA)
-7. Failed solution
-8. Potential solution 1
-9. Potential solution 2
-10. Actual solution 1
-11. Actual solution 2
-12. Amazon video/scarcity
-13. Follow for more outro
+7. Target heatlh cause (Pre-CTA)
+8. Failed solution
+9. Potential solution 1
+10. Potential solution 2
+11. Actual solution 1
+12. Actual solution 2
+13. Amazon video/scarcity
+14. Follow for more outro
 
 ---
 
