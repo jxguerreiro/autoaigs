@@ -22,10 +22,14 @@
 
 > I’ve spent 31 YEARS working inside one of the BUSIEST veterinary clinics, and what I’ve seen over and over again is that most of the issues that quietly STEAL YEARS from a dog’s life are not solved with PRESCRIPTIONS.  
 > They’re solved with CONSISTENT NUTRITION and SIMPLE daily adjustments at home.  
-> Chronic ear problems almost always come from yeast and bacteria thriving because the gut is out of balance, a spoon of plain unsweetened yogurt a few times a week helps restore that balance from the inside.  
-> Bad breath is often a digestion issue not just a dirty mouth. Fresh parsley mixed into meals acts like a natural deodorizer and soothes the stomach.  
-> Dry cracked paw pads are common. Rubbing in a little coconut oil hydrates and heals without chemicals and it is safe even if the dog licks it.  
-> Dogs that cannot relax at night often have low magnesium intake. Adding cooked spinach into meals provides natural calm and helps everyone sleep better.  
+> Chronic ear problems almost always come from yeast and bacteria thriving because the gut is out of balance.
+> A spoon of plain unsweetened yogurt a few times a week helps restore that balance from the inside.  
+> Bad breath is often a digestion issue not just a dirty mouth.
+> Fresh parsley mixed into meals acts like a natural deodorizer and soothes the stomach.  
+> Dry cracked paw pads are common.
+> Rubbing in a little coconut oil hydrates and heals without chemicals and it is safe even if the dog licks it.  
+> Dogs that cannot relax at night often have low magnesium intake.
+> Adding cooked spinach into meals provides natural calm and helps everyone sleep better.  
 > If your dog keeps itching and scratching and biting especially in the belly area then this is probably due to flea bites or hidden ticks.  
 > While most vets recommend chemical pesticides like collars pills or flea sprays these are actually known to cause long term kidney and liver damage to dogs.  
 > The best way that I know to get rid of fleas and ticks is to use a water based natural solution.  
