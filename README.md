@@ -31,7 +31,8 @@
 > Rubbing in a little coconut oil hydrates and heals without chemicals and it is safe even if the dog licks it.  
 > Dogs that cannot relax at night often have low magnesium intake.
 > Adding cooked spinach into meals provides natural calm and helps everyone sleep better.  
-> If your dog keeps itching and scratching and biting especially in the belly area then this is probably due to flea bites or hidden ticks.  
+> If your dog keeps itching and scratching and biting especially in the belly area.
+> Then this is probably due to flea bites or hidden ticks.  
 > While most vets recommend chemical pesticides like collars pills or flea sprays these are actually known to cause long term kidney and liver damage to dogs.  
 > The best way that I know to get rid of fleas and ticks is to use a water based natural solution.  
 > You can make it at home or just buy a pre made concentrate.  
