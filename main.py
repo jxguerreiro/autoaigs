@@ -6,17 +6,21 @@ from pathlib import Path
 GREENSCREEN_DIR = Path("greenscreen")                         # input videos (directory)
 SCRIPTS_DIR     = Path("/home/joao/farm_scripts/scripts")     # NUMBER.txt scripts (directory)
 OUT_DIR         = Path("output_split")                        # working scratch
-FINAL_VIDS_DIR  = Path("final videos")                        # <— final outputs land here
+FINAL_VIDS_DIR  = Path("final videos")                        # final outputs land here
 
 # B-roll libraries
-HOOKS_DIR  = Path("/home/joao/farm_scripts/broll_library/hooks")
-BODIES_DIR = Path("/home/joao/farm_scripts/broll_library/bodies")
+HOOKS_DIR   = Path("/home/joao/farm_scripts/broll_library/hooks")
+BODIES_DIR  = Path("/home/joao/farm_scripts/broll_library/bodies")
+BODIES_ISSUES_DIR = BODIES_DIR / "issues"
+BODIES_HEALTH_DIR = BODIES_DIR / "health"
 
-# explicit override folders (matched from the end backwards)
-AMAZON_DIR = Path("/home/joao/farm_scripts/broll_library/amazon")
-BUGMD_DIR  = Path("/home/joao/farm_scripts/broll_library/bugMD")
-SPRAY_DIR  = Path("/home/joao/farm_scripts/broll_library/spray")
-RASHES_DIR = Path("/home/joao/farm_scripts/broll_library/bodies/rashes skin collars")
+# CTA buckets (moved under cta/)
+CTA_DIR     = Path("/home/joao/farm_scripts/broll_library/cta")
+AMAZON_DIR  = CTA_DIR / "amazon"
+BUGMD_DIR   = CTA_DIR / "bugMD"
+SPRAY_DIR   = CTA_DIR / "spray"
+FLEAS_DIR  = BODIES_ISSUES_DIR / "fleas"
+RASHES_DIR = BODIES_ISSUES_DIR / "rashes"
 
 # whisper
 WHISPER_PY     = "/home/joao/miniconda3/envs/whisper_env/bin/python"
@@ -257,11 +261,68 @@ def get_clip_dur(p: Path, fallback_for_image: float = 36000.0):
     except Exception:
         return 0.1
 
-# ---------- bodies folder selection ----------
+# ---------- tag-matching helpers ----------
+def path_tokens(dir_path: Path, root: Path) -> set[str]:
+    """Tokens from the relative path parts (folder names) for matching."""
+    rel = dir_path.relative_to(root)
+    # join parts with space to allow tokenize_norm to split on non-alnum too
+    joined = " ".join(rel.parts)
+    return set(tokenize_norm(joined))
+
+def most_populated_subfolder(root: Path) -> Path | None:
+    if not root.exists():
+        return None
+    best = None
+    best_count = -1
+    for d in root.rglob("*"):
+        if d.is_dir():
+            cnt = len(list_media_recursive(d))
+            if cnt > best_count:
+                best = d; best_count = cnt
+    return best if best_count > 0 else (root if len(list_media_recursive(root))>0 else None)
+
+def best_tagged_subfolder(root: Path, sentence: str) -> Path | None:
+    """
+    Search ALL subfolders under root and pick the folder whose path tokens
+    have the highest overlap with the sentence tokens. Tie-break by media count.
+    Fallback to most populated subfolder; finally to root if it has media.
+    """
+    if not root.exists():
+        return None
+    sent = set(tokenize_norm(sentence))
+    best = None
+    best_score = -1
+    best_media = -1
+
+    # include both direct subdirs and deeper ones
+    candidates = [d for d in root.rglob("*") if d.is_dir()]
+    # If no subdirs, allow root itself as candidate
+    if not candidates:
+        candidates = [root]
+
+    for d in candidates:
+        toks = path_tokens(d, root)
+        score = len(sent & toks)
+        media_cnt = len(list_media_recursive(d))
+        if score > best_score or (score == best_score and media_cnt > best_media):
+            best = d; best_score = score; best_media = media_cnt
+
+    if best_score > 0 and best_media > 0:
+        return best
+
+    # no token match – fall back to most populated subfolder (deterministic)
+    fallback = most_populated_subfolder(root)
+    if fallback:
+        return fallback
+
+    # last resort: if root itself has media
+    return root if len(list_media_recursive(root)) > 0 else None
+
+# ---------- bodies folder selection (semantic fallback kept) ----------
 def folder_tokens(name: str): return set(tokenize_norm(name))
 
 def best_bodies_folder_by_keywords(sentence: str):
-    """Pick a subfolder under BODIES_DIR by token overlap (fallback: most populated)."""
+    """Legacy fallback: top-level under BODIES_DIR by token overlap."""
     sent_tokens = set(tokenize_norm(sentence))
     subfolders = [d for d in BODIES_DIR.iterdir() if d.is_dir()]
     best, best_score = None, -1.0
@@ -475,20 +536,50 @@ def fast_transparent_segment(input_path: str, output_mov: str, target_height: in
 # ---------- end→back folder override ----------
 def choose_broll_folder_for_index(i: int, N: int, sentence_text: str, last_first_clip_path, hooks_mode: bool):
     """
-    End→back blocks (highest priority, timings unchanged):
-      - last 2 (from_end: 0,1) → AMAZON_DIR
-      - prev 2 (from_end: 2,3) → BUGMD_DIR
-      - prev 2 (from_end: 4,5) → SPRAY_DIR
-    Then:
-      - if i == 7 (8th sentence overall), use RASHES_DIR (unless overridden above).
-    Otherwise fallback to semantic folder under BODIES_DIR.
+    Folder strategy (timings unchanged):
+      Hooks:
+        - First 2 sentences (i=0,1): pick best tagged subfolder under HOOKS_DIR.
+
+      Tail (from the end, highest priority):
+        - from_end == 8  → bodies/issues/fleas
+        - from_end == 7  → bodies/issues/rashes
+        - from_end in 6,5 → cta/spray
+        - from_end in 4,3 → cta/bugMD
+        - from_end == 2  → cta/amazon
+        - from_end == 1  → handled by full-screen outro (we never call this for i==N-1)
+
+      Middle (everything else):
+        - alternate issues/health starting at i=2,
+          and inside that root pick the best tagged subfolder by sentence.
     """
     from_end = (N - 1) - i
-    if from_end in (0, 1) and AMAZON_DIR.exists(): return AMAZON_DIR
-    if from_end in (2, 3) and BUGMD_DIR.exists():   return BUGMD_DIR
-    if from_end in (4, 5) and SPRAY_DIR.exists():   return SPRAY_DIR
-    if i == 7 and RASHES_DIR.exists():              return RASHES_DIR
-    if hooks_mode: return HOOKS_DIR if HOOKS_DIR.exists() else BODIES_DIR
+
+    # Hard tail mapping
+    if from_end == 7 and FLEAS_DIR.exists():
+        return FLEAS_DIR
+    if from_end == 6 and RASHES_DIR.exists():
+        return RASHES_DIR
+    if from_end in (5, 4) and SPRAY_DIR.exists():
+        return SPRAY_DIR
+    if from_end in (3, 2) and BUGMD_DIR.exists():
+        return BUGMD_DIR
+    if from_end == 1 and AMAZON_DIR.exists():
+        return AMAZON_DIR
+
+    # Hooks for first two: tag-matched under HOOKS_DIR
+    if hooks_mode:
+        folder = best_tagged_subfolder(HOOKS_DIR, sentence_text)
+        return folder if folder else (HOOKS_DIR if HOOKS_DIR.exists() else BODIES_DIR)
+
+    # Middle: alternate issues/health starting at i=2, tag-match within that root
+    alt_idx = i - 2
+    root = BODIES_ISSUES_DIR if (alt_idx % 2 == 0) else BODIES_HEALTH_DIR
+    if root.exists():
+        folder = best_tagged_subfolder(root, sentence_text)
+        if folder:
+            return folder
+
+    # Fallbacks
     folder = best_bodies_folder_by_keywords(sentence_text)
     return folder if (folder and folder.exists()) else BODIES_DIR
 
