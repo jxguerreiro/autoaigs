@@ -1,3 +1,43 @@
+#B roll folder structure
+
+broll_library/
+├─ bodies/
+│  ├─ health/
+│  │  ├─ apple/
+│  │  ├─ banana/
+│  │  ├─ blueberries/
+│  │  ├─ broccoli sprouts/
+│  │  ├─ broth/
+│  │  ├─ coconut/
+│  │  ├─ cranberry/
+│  │  ├─ egg yolk/
+│  │  ├─ parsley/
+│  │  ├─ pumpkin/
+│  │  ├─ sardines/
+│  │  ├─ spinach/
+│  │  ├─ sweet potatoes potato/
+│  │  ├─ turmeric/
+│  │  └─ yogurt kefir/
+│  └─ issues/
+│     ├─ diarrhea/
+│     ├─ ear/
+│     ├─ epilepsy/
+│     ├─ eye/
+│     ├─ fleas/
+│     ├─ humping/
+│     ├─ paw/
+│     ├─ rashes/
+│     ├─ scooting/
+│     ├─ shedding/
+│     ├─ teeth breath/
+│     └─ vomit barf digestive/
+├─ cta/
+│  ├─ amazon/
+│  ├─ bugMD/
+│  └─ spray/
+└─ hooks/
+
+
 # Writing scripts
 
 ## Script structure has to be strictly:
