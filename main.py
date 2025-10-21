@@ -2,44 +2,64 @@
 import os, re, json, time, random, shlex, subprocess, tempfile, hashlib, shutil
 from pathlib import Path
 
+# ------------------------------ .env loader (no deps) ------------------------------
+def load_env_file(dotenv_path: Path = Path(".env")):
+    if not dotenv_path.exists():
+        return
+    for raw in dotenv_path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip()
+        v = v.strip().strip('"').strip("'")
+        # keep existing process env precedence
+        os.environ.setdefault(k, v)
+
+load_env_file()
+
 # ================== CONFIG (FOLDERS) ==================
-GREENSCREEN_DIR = Path("greenscreen")                         # input videos (directory)
-SCRIPTS_DIR     = Path("/home/joao/farm_scripts/scripts")     # NUMBER.txt scripts (directory)
-OUT_DIR         = Path("output_split")                        # working scratch
-FINAL_VIDS_DIR  = Path("final videos")                        # final outputs land here
+def _pp(env_key: str, default: str) -> Path:
+    return Path(os.getenv(env_key, default)).expanduser().resolve()
+
+GREENSCREEN_DIR = _pp("GREENSCREEN_DIR", "greenscreen")                         # input videos
+SCRIPTS_DIR     = _pp("SCRIPTS_DIR",     "/home/joao/farm_scripts/scripts")     # NUMBER.txt
+OUT_DIR         = _pp("OUT_DIR",         "output_split")                        # working scratch
+FINAL_VIDS_DIR  = _pp("FINAL_VIDS_DIR",  "final videos")                        # final outputs
 
 # B-roll libraries
-HOOKS_DIR   = Path("/home/joao/farm_scripts/broll_library/hooks")
-BODIES_DIR  = Path("/home/joao/farm_scripts/broll_library/bodies")
-BODIES_ISSUES_DIR = BODIES_DIR / "issues"
-BODIES_HEALTH_DIR = BODIES_DIR / "health"
+HOOKS_DIR          = _pp("HOOKS_DIR",          "/home/joao/farm_scripts/broll_library/hooks")
+BODIES_DIR         = _pp("BODIES_DIR",         "/home/joao/farm_scripts/broll_library/bodies")
+BODIES_ISSUES_DIR  = BODIES_DIR / "issues"
+BODIES_HEALTH_DIR  = BODIES_DIR / "health"
 
-# CTA buckets (moved under cta/)
-CTA_DIR     = Path("/home/joao/farm_scripts/broll_library/cta")
-AMAZON_DIR  = CTA_DIR / "amazon"
-BUGMD_DIR   = CTA_DIR / "bugMD"
-SPRAY_DIR   = CTA_DIR / "spray"
+# CTA buckets
+CTA_DIR    = _pp("CTA_DIR", "/home/joao/farm_scripts/broll_library/cta")
+AMAZON_DIR = CTA_DIR / "amazon"
+BUGMD_DIR  = CTA_DIR / "bugMD"
+SPRAY_DIR  = CTA_DIR / "spray"
 FLEAS_DIR  = BODIES_ISSUES_DIR / "fleas"
 RASHES_DIR = BODIES_ISSUES_DIR / "rashes"
 
-# whisper
-WHISPER_PY     = "/home/joao/miniconda3/envs/whisper_env/bin/python"
-WHISPER_MODEL  = os.getenv("WHISPER_MODEL","medium")
-USE_FASTER_WHISPER = os.getenv("USE_FASTER_WHISPER","1") not in ("0","false","False")
-FW_DEVICE       = os.getenv("FASTER_WHISPER_DEVICE", os.getenv("WHISPER_DEVICE","cuda"))
-FW_COMPUTE_TYPE = os.getenv("FASTER_WHISPER_COMPUTE_TYPE","int8_float16" if FW_DEVICE=="cuda" else "int8")
-FP16            = False
+# whisper / faster-whisper
+WHISPER_PY           = os.getenv("WHISPER_PY", "/home/joao/miniconda3/envs/whisper_env/bin/python")
+WHISPER_MODEL        = os.getenv("WHISPER_MODEL", "medium")
+USE_FASTER_WHISPER   = os.getenv("USE_FASTER_WHISPER", "1") not in ("0","false","False")
+FW_DEVICE            = os.getenv("FASTER_WHISPER_DEVICE", os.getenv("WHISPER_DEVICE", "cuda"))
+FW_COMPUTE_TYPE      = os.getenv("FASTER_WHISPER_COMPUTE_TYPE", "int8_float16" if FW_DEVICE == "cuda" else "int8")
+FP16                 = os.getenv("WHISPER_FP16", "0") in ("1","true","True")
 
 # ffmpeg
-USE_HWACCEL_CUDA = os.getenv("USE_HWACCEL_CUDA","1") not in ("0","false","False")
+USE_HWACCEL_CUDA     = os.getenv("USE_HWACCEL_CUDA", "1") not in ("0","false","False")
 
 # silence clamp
-MIN_SILENCE_SEC   = float(os.getenv("MIN_SILENCE_SEC","0.7"))
-KEEP_SILENCE_SEC  = 0.15
-SILENCE_NOISE_DB  = float(os.getenv("SILENCE_NOISE_DB","-35.0"))
+MIN_SILENCE_SEC      = float(os.getenv("MIN_SILENCE_SEC", "0.7"))
+KEEP_SILENCE_SEC     = float(os.getenv("KEEP_SILENCE_SEC", "0.15"))
+SILENCE_NOISE_DB     = float(os.getenv("SILENCE_NOISE_DB", "-35.0"))
 
 # final speed
-FINAL_SPEED       = float(os.getenv("FINAL_SPEED","1.1"))
+FINAL_SPEED          = float(os.getenv("FINAL_SPEED", "1.1"))
+
 # ======================================================
 
 # ---------- logging / exec ----------
@@ -64,12 +84,13 @@ def ff_has_nvenc():
 
 NVENC_OK = ff_has_nvenc()
 def vcodec_flags():
-    return "-c:v h264_nvenc -preset p4 -rc vbr -cq 19 -b:v 0 -pix_fmt yuv420p" if NVENC_OK else "-c:v libx264 -pix_fmt yuv420p"
+    # tuned for speed; adjust if needed
+    return "-c:v h264_nvenc -preset p4 -rc vbr -cq 19 -b:v 0 -pix_fmt yuv420p" if NVENC_OK else "-c:v libx264 -preset veryfast -pix_fmt yuv420p"
 def hwaccel_prefix(): return "-hwaccel cuda " if (NVENC_OK and USE_HWACCEL_CUDA) else ""
 
 # ---------- probes ----------
 _ff_cache = {}
-def ffprobe_stream(path):
+def ffprobe_stream(path: str):
     if path in _ff_cache: return _ff_cache[path]
     j = run(f'ffprobe -v error -select_streams v:0 -show_entries stream=width,height,r_frame_rate,duration -of json "{path}"', echo=False).stdout
     info = json.loads(j)["streams"][0]
@@ -181,21 +202,37 @@ def faster_whisper_words(audio_wav_path):
     except Exception as e:
         log(f"faster-whisper import failed: {e} — using whisper CPU")
         return whisper_words_fallback(audio_wav_path)
-    model = WhisperModel(WHISPER_MODEL, device=FW_DEVICE, compute_type=FW_COMPUTE_TYPE)
+    # Robust device init with CPU fallback
+    try:
+        model = WhisperModel(WHISPER_MODEL, device=FW_DEVICE, compute_type=FW_COMPUTE_TYPE)
+    except Exception as e:
+        log(f"faster-whisper init failed on '{FW_DEVICE}' ({e}); retrying on CPU int8")
+        model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
     words=[]
-    segments, _ = model.transcribe(audio_wav_path, task="transcribe", vad_filter=True, beam_size=1,
-                                   word_timestamps=True, temperature=0.0, condition_on_previous_text=False)
-    for s in segments:
-        for w in (s.words or []):
-            txt=(w.word or "").strip()
-            if txt: words.append({"word":txt, "start":float(w.start), "end":float(w.end)})
-    return words
+    try:
+        segments, _ = model.transcribe(
+            audio_wav_path,
+            task="transcribe",
+            vad_filter=True,
+            beam_size=1,
+            word_timestamps=True,
+            temperature=0.0,
+            condition_on_previous_text=False
+        )
+        for s in segments:
+            for w in (s.words or []):
+                txt=(w.word or "").strip()
+                if txt: words.append({"word":txt, "start":float(w.start), "end":float(w.end)})
+        return words
+    except Exception as e:
+        log(f"faster-whisper transcribe failed ({e}); using whisper CPU")
+        return whisper_words_fallback(audio_wav_path)
 
 def whisper_words(audio_wav_path):
     return faster_whisper_words(audio_wav_path) if USE_FASTER_WHISPER else whisper_words_fallback(audio_wav_path)
 
 # ---------- subtitles ----------
-def write_centered_ass_chunks(chunks, seg_dur, out_ass_path, font="Arial", size=64, outline=4, shadow=0):
+def write_centered_ass_chunks(chunks, out_ass_path, font="Arial", size=64, outline=4, shadow=0):
     def ts(t):
         t = max(0.0, float(t)); h=int(t//3600); m=int((t%3600)//60); s=int(t%60); cs=int(round((t-int(t))*100))
         return f"{h:d}:{m:02d}:{s:02d}.{cs:02d}"
@@ -248,11 +285,10 @@ def build_audio_chunks_for_window(words, win_start, win_end, max_chars=26, max_w
 MEDIA_VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".m4v"}
 MEDIA_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 def is_image(p: Path) -> bool: return p.suffix.lower() in MEDIA_IMAGE_EXTS
-def is_video(p: Path) -> bool: return p.suffix.lower() in MEDIA_VIDEO_EXTS
-ALL_MEDIA_EXTS = MEDIA_VIDEO_EXTS | MEDIA_IMAGE_EXTS
 
 def list_media_recursive(folder: Path):
-    return sorted([p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() in (MEDIA_VIDEO_EXTS | MEDIA_IMAGE_EXTS)])
+    valid = MEDIA_VIDEO_EXTS | MEDIA_IMAGE_EXTS
+    return sorted([p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() in valid])
 
 def get_clip_dur(p: Path, fallback_for_image: float = 36000.0):
     if is_image(p): return float(fallback_for_image)
@@ -263,9 +299,7 @@ def get_clip_dur(p: Path, fallback_for_image: float = 36000.0):
 
 # ---------- tag-matching helpers ----------
 def path_tokens(dir_path: Path, root: Path) -> set[str]:
-    """Tokens from the relative path parts (folder names) for matching."""
     rel = dir_path.relative_to(root)
-    # join parts with space to allow tokenize_norm to split on non-alnum too
     joined = " ".join(rel.parts)
     return set(tokenize_norm(joined))
 
@@ -279,56 +313,40 @@ def most_populated_subfolder(root: Path) -> Path | None:
             cnt = len(list_media_recursive(d))
             if cnt > best_count:
                 best = d; best_count = cnt
-    return best if best_count > 0 else (root if len(list_media_recursive(root))>0 else None)
+    if best_count > 0:
+        return best
+    root_media = len(list_media_recursive(root))>0
+    return root if root_media else None
 
 def best_tagged_subfolder(root: Path, sentence: str) -> Path | None:
-    """
-    Search ALL subfolders under root and pick the folder whose path tokens
-    have the highest overlap with the sentence tokens. Tie-break by media count.
-    Fallback to most populated subfolder; finally to root if it has media.
-    """
     if not root.exists():
         return None
     sent = set(tokenize_norm(sentence))
     best = None
     best_score = -1
     best_media = -1
-
-    # include both direct subdirs and deeper ones
-    candidates = [d for d in root.rglob("*") if d.is_dir()]
-    # If no subdirs, allow root itself as candidate
-    if not candidates:
-        candidates = [root]
-
+    candidates = [d for d in root.rglob("*") if d.is_dir()] or [root]
     for d in candidates:
         toks = path_tokens(d, root)
         score = len(sent & toks)
         media_cnt = len(list_media_recursive(d))
         if score > best_score or (score == best_score and media_cnt > best_media):
             best = d; best_score = score; best_media = media_cnt
-
     if best_score > 0 and best_media > 0:
         return best
-
-    # no token match – fall back to most populated subfolder (deterministic)
     fallback = most_populated_subfolder(root)
     if fallback:
         return fallback
-
-    # last resort: if root itself has media
     return root if len(list_media_recursive(root)) > 0 else None
 
-# ---------- bodies folder selection (semantic fallback kept) ----------
 def folder_tokens(name: str): return set(tokenize_norm(name))
 
 def best_bodies_folder_by_keywords(sentence: str):
-    """Legacy fallback: top-level under BODIES_DIR by token overlap."""
     sent_tokens = set(tokenize_norm(sentence))
-    subfolders = [d for d in BODIES_DIR.iterdir() if d.is_dir()]
+    subfolders = [d for d in BODIES_DIR.iterdir() if d.is_dir()] if BODIES_DIR.exists() else []
     best, best_score = None, -1.0
     for d in subfolders:
-        ft = folder_tokens(d.name)
-        inter = len(sent_tokens & ft)
+        inter = len(sent_tokens & folder_tokens(d.name))
         if inter > best_score:
             best, best_score = d, inter
     if best is None and subfolders:
@@ -354,7 +372,8 @@ def plan_broll_sequence_in_folder(folder: Path, need_sec: float, avoid_first: Pa
         planned=[(p1, clip1), (p2, clip2)]
     else:
         planned=[(p1, d1), (p2, min(d2, remaining))]
-    total = sum(t for _,t in planned); guard=0
+    total = sum(t for _,t in planned)
+    guard=0
     while total + 0.01 < need_sec and guard < 32:
         p = rnd.choice(files); d = get_clip_dur(p); take = min(d, need_sec-total)
         planned.append((p, take)); total += take; guard += 1
@@ -536,42 +555,24 @@ def fast_transparent_segment(input_path: str, output_mov: str, target_height: in
 # ---------- end→back folder override ----------
 def choose_broll_folder_for_index(i: int, N: int, sentence_text: str, last_first_clip_path, hooks_mode: bool):
     """
-    Folder strategy (timings unchanged):
-      Hooks:
-        - First 2 sentences (i=0,1): pick best tagged subfolder under HOOKS_DIR.
-
-      Tail (from the end, highest priority):
-        - from_end == 8  → bodies/issues/fleas
-        - from_end == 7  → bodies/issues/rashes
-        - from_end in 6,5 → cta/spray
-        - from_end in 4,3 → cta/bugMD
-        - from_end == 2  → cta/amazon
-        - from_end == 1  → handled by full-screen outro (we never call this for i==N-1)
-
-      Middle (everything else):
-        - alternate issues/health starting at i=2,
-          and inside that root pick the best tagged subfolder by sentence.
+    Strategy:
+      Hooks (i=0,1): best-tagged under HOOKS_DIR.
+      Tail from end:
+        7→fleas, 6→rashes, 5/4→spray, 3/2→bugMD, 1→amazon
+      Middle: alternate issues/health (starting at i=2), best-tagged inside that root.
     """
     from_end = (N - 1) - i
 
-    # Hard tail mapping
-    if from_end == 7 and FLEAS_DIR.exists():
-        return FLEAS_DIR
-    if from_end == 6 and RASHES_DIR.exists():
-        return RASHES_DIR
-    if from_end in (5, 4) and SPRAY_DIR.exists():
-        return SPRAY_DIR
-    if from_end in (3, 2) and BUGMD_DIR.exists():
-        return BUGMD_DIR
-    if from_end == 1 and AMAZON_DIR.exists():
-        return AMAZON_DIR
+    if from_end == 7 and FLEAS_DIR.exists():   return FLEAS_DIR
+    if from_end == 6 and RASHES_DIR.exists():  return RASHES_DIR
+    if from_end in (5, 4) and SPRAY_DIR.exists(): return SPRAY_DIR
+    if from_end in (3, 2) and BUGMD_DIR.exists(): return BUGMD_DIR
+    if from_end == 1 and AMAZON_DIR.exists():  return AMAZON_DIR
 
-    # Hooks for first two: tag-matched under HOOKS_DIR
     if hooks_mode:
         folder = best_tagged_subfolder(HOOKS_DIR, sentence_text)
         return folder if folder else (HOOKS_DIR if HOOKS_DIR.exists() else BODIES_DIR)
 
-    # Middle: alternate issues/health starting at i=2, tag-match within that root
     alt_idx = i - 2
     root = BODIES_ISSUES_DIR if (alt_idx % 2 == 0) else BODIES_HEALTH_DIR
     if root.exists():
@@ -579,7 +580,6 @@ def choose_broll_folder_for_index(i: int, N: int, sentence_text: str, last_first
         if folder:
             return folder
 
-    # Fallbacks
     folder = best_bodies_folder_by_keywords(sentence_text)
     return folder if (folder and folder.exists()) else BODIES_DIR
 
@@ -597,8 +597,7 @@ def _extract_number_from_scriptish(stem: str) -> str | None:
 def _slugify(s: str, max_len: int = 60) -> str:
     s = strip_accents(s)
     s = re.sub(r'[^a-zA-Z0-9]+', '-', s).strip('-').lower()
-    if not s: s = "clip"
-    return s[:max_len]
+    return (s or "clip")[:max_len]
 
 def _short_stable_id(p: Path, length: int = 4) -> str:
     h = hashlib.sha1(str(p.resolve()).encode('utf-8')).hexdigest()
@@ -608,34 +607,20 @@ def _already_tagged(fname: str) -> bool:
     return re.match(r'^\d+__.+\.[A-Za-z0-9]+$', fname) is not None
 
 def normalize_greenscreen_filenames(gs_dir: Path, scripts_dir: Path) -> dict:
-    """
-    Tag each video with its script number: '<num>__<slugified-original-stem>.<ext>'
-    - If file already starts with '<num>__', it's left as-is.
-    - If multiple videos map to the same target, append short '-<hash4>' (and -2, -3 if needed).
-    Only rename if scripts/<num>.txt exists.
-    """
     renames = {}
-    if not gs_dir.exists():
-        return renames
-
+    if not gs_dir.exists(): return renames
     for p in gs_dir.iterdir():
         if not p.is_file(): continue
         ext = p.suffix.lower()
         if ext not in VALID_VIDEO_EXTS: continue
-
-        if _already_tagged(p.name):
-            continue
+        if _already_tagged(p.name): continue
 
         num = _extract_number_from_scriptish(p.stem) or _extract_number_anywhere(p.stem)
-        if not num:
-            continue
-        if not (scripts_dir / f"{num}.txt").exists():
-            continue
+        if not num: continue
+        if not (scripts_dir / f"{num}.txt").exists(): continue
 
         slug = _slugify(p.stem)
-        base = f"{num}__{slug}{ext}"
-        target = gs_dir / base
-
+        target = gs_dir / f"{num}__{slug}{ext}"
         if target.exists():
             suf = _short_stable_id(p)
             target = gs_dir / f"{num}__{slug}-{suf}{ext}"
@@ -643,14 +628,12 @@ def normalize_greenscreen_filenames(gs_dir: Path, scripts_dir: Path) -> dict:
             while target.exists() and counter < 1000:
                 target = gs_dir / f"{num}__{slug}-{suf}-{counter}{ext}"
                 counter += 1
-
         try:
             p.rename(target)
             renames[str(p)] = str(target)
             log(f"🔤 tagged: {p.name} → {target.name}")
         except Exception as e:
             log(f"❌ rename failed for {p.name}: {e}")
-
     return renames
 
 # ---------- discovery ----------
@@ -660,20 +643,12 @@ def _extract_number_from_tagged_or_any(stem: str) -> str | None:
     return _extract_number_anywhere(stem)
 
 def find_processable_videos(gs_dir: Path, scripts_dir: Path):
-    """
-    Return list of (video_path, script_path) where:
-      - video is a file with a detectable number (tagged or anywhere in name)
-      - matching scripts/<num>.txt exists
-    """
     vids = []
-    if not gs_dir.exists():
-        return vids
+    if not gs_dir.exists(): return vids
     for p in sorted(gs_dir.iterdir()):
-        if not (p.is_file() and p.suffix.lower() in VALID_VIDEO_EXTS):
-            continue
+        if not (p.is_file() and p.suffix.lower() in VALID_VIDEO_EXTS): continue
         num = _extract_number_from_tagged_or_any(p.stem)
-        if not num: 
-            continue
+        if not num: continue
         s = scripts_dir / f"{num}.txt"
         if s.exists():
             vids.append((p, s))
@@ -681,15 +656,12 @@ def find_processable_videos(gs_dir: Path, scripts_dir: Path):
 
 # ---------- final mover & cleaner ----------
 def _unique_dest(base_path: Path) -> Path:
-    """Return a non-colliding destination path (adds -1, -2, ... if needed)."""
-    if not base_path.exists():
-        return base_path
+    if not base_path.exists(): return base_path
     stem, ext = base_path.stem, base_path.suffix
     i = 1
     while True:
         cand = base_path.with_name(f"{stem}-{i}{ext}")
-        if not cand.exists():
-            return cand
+        if not cand.exists(): return cand
         i += 1
 
 def move_to_final(final_out: Path, final_dir: Path) -> Path:
@@ -699,9 +671,7 @@ def move_to_final(final_out: Path, final_dir: Path) -> Path:
     return dest
 
 def clean_output_dir(out_dir: Path):
-    """Hard-clean the output scratch directory (files + subfolders)."""
-    if not out_dir.exists():
-        return
+    if not out_dir.exists(): return
     for item in out_dir.iterdir():
         try:
             if item.is_file() or item.is_symlink():
@@ -748,7 +718,7 @@ def process_one(input_video: Path, script_txt: Path):
         with tempfile.TemporaryDirectory() as td_sub:
             ass_path = Path(td_sub)/"seg.ass"
             rel_chunks = build_audio_chunks_for_window(words, p["start"], p["end"])
-            write_centered_ass_chunks(rel_chunks, dur, ass_path)
+            write_centered_ass_chunks(rel_chunks, ass_path)
 
             if i == N-1:
                 ss = max(0.0, p["start"]); to = max(ss + 0.05, p["end"])
@@ -803,7 +773,7 @@ def process_one(input_video: Path, script_txt: Path):
     log(f"⏩ applying global {FINAL_SPEED}x speed…")
     speed_up_final(str(clamped), str(final_out), speed=FINAL_SPEED)
 
-    # move final → "final videos" and clean OUT_DIR
+    # move final → final dir and clean OUT_DIR
     dest = move_to_final(final_out, FINAL_VIDS_DIR)
     log(f"📦 moved final → {dest}")
     clean_output_dir(OUT_DIR)
@@ -811,7 +781,7 @@ def process_one(input_video: Path, script_txt: Path):
 
     return dest
 
-# ---------- batch runner (always) ----------
+# ---------- batch runner (simple all-in-one) ----------
 def main():
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     FINAL_VIDS_DIR.mkdir(parents=True, exist_ok=True)
