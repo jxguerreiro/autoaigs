@@ -25,7 +25,7 @@ def _pp(env_key: str, default: str) -> Path:
 GREENSCREEN_DIR = _pp("GREENSCREEN_DIR", "greenscreen")                         # input videos
 SCRIPTS_DIR     = _pp("SCRIPTS_DIR",     "/home/joao/farm_scripts/scripts")     # NUMBER.txt
 OUT_DIR         = _pp("OUT_DIR",         "output_split")                        # working scratch
-FINAL_VIDS_DIR  = _pp("FINAL_VIDS_DIR",  "final videos")                        # final outputs
+FINAL_VIDS_DIR  = _pp("FINAL_VIDS_DIR",  "final_videos")                        # final outputs
 
 # B-roll libraries
 HOOKS_DIR          = _pp("HOOKS_DIR",          "/home/joao/farm_scripts/broll_library/hooks")
