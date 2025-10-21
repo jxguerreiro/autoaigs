@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import os, re, json, time, random, shlex, subprocess, tempfile, hashlib, shutil
 from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # ------------------------------ .env loader (no deps) ------------------------------
 def load_env_file(dotenv_path: Path = Path(".env")):
@@ -13,7 +14,6 @@ def load_env_file(dotenv_path: Path = Path(".env")):
         k, v = line.split("=", 1)
         k = k.strip()
         v = v.strip().strip('"').strip("'")
-        # keep existing process env precedence
         os.environ.setdefault(k, v)
 
 load_env_file()
@@ -60,16 +60,21 @@ SILENCE_NOISE_DB     = float(os.getenv("SILENCE_NOISE_DB", "-35.0"))
 # final speed
 FINAL_SPEED          = float(os.getenv("FINAL_SPEED", "1.1"))
 
+# worker knobs
+SEG_RENDER_WORKERS   = int(os.getenv("SEG_RENDER_WORKERS", "2"))   # segments per video
+VIDEO_WORKERS        = int(os.getenv("VIDEO_WORKERS", "1"))        # videos in batch
+
 # ======================================================
 
 # ---------- logging / exec ----------
 _t0 = time.time()
-def log(msg): print(f"[{time.time()-_t0:7.2f}s] {msg}")
+def log_step(step: str):
+    print(f"[{time.time()-_t0:7.2f}s] {step}")
 
-def run(cmd, echo=True):
-    if echo:
-        print("\n── ffcmd ──")
-        print(cmd)
+# Alias to keep any legacy log(...) calls quiet and consistent
+log = log_step
+
+def run(cmd, echo=False):
     p = subprocess.run(shlex.split(cmd), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if p.returncode != 0:
         raise RuntimeError(p.stderr.strip() or "Command failed")
@@ -200,13 +205,12 @@ def faster_whisper_words(audio_wav_path):
     try:
         from faster_whisper import WhisperModel
     except Exception as e:
-        log(f"faster-whisper import failed: {e} — using whisper CPU")
+        log(f"ASR: faster-whisper import failed ({e}) — fallback to whisper CPU")
         return whisper_words_fallback(audio_wav_path)
-    # Robust device init with CPU fallback
     try:
         model = WhisperModel(WHISPER_MODEL, device=FW_DEVICE, compute_type=FW_COMPUTE_TYPE)
     except Exception as e:
-        log(f"faster-whisper init failed on '{FW_DEVICE}' ({e}); retrying on CPU int8")
+        log(f"ASR: faster-whisper init failed on '{FW_DEVICE}' ({e}); retry CPU int8")
         model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
     words=[]
     try:
@@ -225,7 +229,7 @@ def faster_whisper_words(audio_wav_path):
                 if txt: words.append({"word":txt, "start":float(w.start), "end":float(w.end)})
         return words
     except Exception as e:
-        log(f"faster-whisper transcribe failed ({e}); using whisper CPU")
+        log(f"ASR: faster-whisper transcribe failed ({e}); fallback to whisper CPU")
         return whisper_words_fallback(audio_wav_path)
 
 def whisper_words(audio_wav_path):
@@ -433,7 +437,7 @@ def render_segment_single_call(out_path, base_seq, person_mov, seg_start, seg_en
 
     cmd += ["-filter_complex",";".join(chains),"-map",map_video,"-an"]
     cmd += vcodec_flags().split(); cmd += [str(out_path)]
-    run(" ".join(shlex.quote(c) for c in cmd), echo=True)
+    run(" ".join(shlex.quote(c) for c in cmd), echo=False)
 
 def render_outro_with_subs(out_path, input_video, ss, to, W, H, fps, ass_path):
     ass = Path(ass_path).as_posix().replace("\\","/")
@@ -446,7 +450,7 @@ def render_outro_with_subs(out_path, input_video, ss, to, W, H, fps, ass_path):
         f'-i "{input_video}" -an -filter_complex "{filt}" -map "[v]" {vcodec_flags()} "{out_path}"'
     )
 
-# ---------- silence clamp ----------
+# ---------- silence clamp + speed (one pass) ----------
 def _parse_silencedetect(log_text):
     sil=[]; cur={}
     for line in log_text.splitlines():
@@ -462,15 +466,30 @@ def _parse_silencedetect(log_text):
             except: pass
     return sil
 
-def shrink_silences_keep(in_path: str, out_path: str,
-                         min_silence=0.7, keep_silence=0.15, noise_db=-35.0):
+def _atempo_chain(speed: float) -> str:
+    s = float(speed)
+    if s <= 0:
+        raise ValueError("Speed must be > 0")
+    parts = []
+    while s < 0.5:
+        parts.append("atempo=0.5"); s /= 0.5
+    while s > 2.0:
+        parts.append("atempo=2.0"); s /= 2.0
+    parts.append(f"atempo={s:.6f}")
+    return ",".join(parts)
+
+def clamp_and_speed(in_path: str, out_path: str, speed: float = 1.1,
+                    min_silence: float = 0.7, keep_silence: float = 0.15, noise_db: float = -35.0):
     p = subprocess.run(shlex.split(
-        f'ffmpeg -hide_banner -nostdin -i "{in_path}" -af silencedetect=noise={noise_db}dB:d={min_silence} -f null -'
+        f'ffmpeg -hide_banner -nostdin -i "{in_path}" '
+        f'-af silencedetect=noise={noise_db}dB:d={min_silence} -f null -'
     ), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     silences = _parse_silencedetect(p.stderr)
+
     j = run(f'ffprobe -v error -show_entries format=duration -of json "{in_path}"', echo=False).stdout
     T = float(json.loads(j)["format"]["duration"])
     has_aud = has_audio_stream(in_path)
+
     EPS=1e-3; windows=[]; t=0.0
     for s,e,d in silences:
         s=max(0.0,s); e=max(s,e)
@@ -483,28 +502,138 @@ def shrink_silences_keep(in_path: str, out_path: str,
             if e-s>EPS: windows.append((s,e))
             t=e
     if T-t>EPS: windows.append((t,T))
-    if len(windows)<=1:
-        run(f'ffmpeg -y -nostdin -loglevel error -i "{in_path}" -c copy -movflags +faststart "{out_path}"', echo=False); return
+
+    if len(windows) <= 1:
+        if has_aud:
+            run(
+                f'ffmpeg -y -nostdin -loglevel error -i "{in_path}" '
+                f'-filter_complex "[0:v]setpts=PTS/{speed}[v];[0:a]{_atempo_chain(speed)}[a]" '
+                f'-map "[v]" -map "[a]" {vcodec_flags()} -c:a aac -b:a 192k -movflags +faststart "{out_path}"',
+                echo=False
+            )
+        else:
+            run(
+                f'ffmpeg -y -nostdin -loglevel error -i "{in_path}" '
+                f'-vf "setpts=PTS/{speed}" {vcodec_flags()} -an -movflags +faststart "{out_path}"',
+                echo=False
+            )
+        return
+
     parts_v=[]; parts_a=[]
     for i,(a,b) in enumerate(windows):
         a=max(0.0,a); b=max(a+0.0005,b)
         parts_v.append(f'[0:v]trim=start={a:.6f}:end={b:.6f},setpts=PTS-STARTPTS[v{i}]')
-        if has_aud: parts_a.append(f'[0:a]atrim=start={a:.6f}:end={b:.6f},asetpts=PTS-STARTPTS[a{i}]')
+        if has_aud:
+            parts_a.append(f'[0:a]atrim=start={a:.6f}:end={b:.6f},asetpts=PTS-STARTPTS[a{i}]')
+
     v_inputs=''.join(f'[v{i}]' for i in range(len(windows)))
     if has_aud:
         a_inputs=''.join(f'[a{i}]' for i in range(len(windows)))
-        filt=';'.join(parts_v+parts_a+[f'{v_inputs}concat=n={len(windows)}:v=1:a=0[v]', f'{a_inputs}concat=n={len(windows)}:v=0:a=1[a]'])
-        run(f'ffmpeg -y -nostdin -loglevel error -i "{in_path}" -filter_complex "{filt}" -map "[v]" -map "[a]" {vcodec_flags()} -c:a aac -b:a 192k -movflags +faststart "{out_path}"', echo=False)
+        filt = ';'.join(
+            parts_v + parts_a + [
+                f'{v_inputs}concat=n={len(windows)}:v=1:a=0[vcat]',
+                f'{a_inputs}concat=n={len(windows)}:v=0:a=1[acat]',
+                f'[vcat]setpts=PTS/{speed}[vout]',
+                f'[acat]{_atempo_chain(speed)}[aout]'
+            ]
+        )
+        run(
+            f'ffmpeg -y -nostdin -loglevel error -i "{in_path}" '
+            f'-filter_complex "{filt}" -map "[vout]" -map "[aout]" '
+            f'{vcodec_flags()} -c:a aac -b:a 192k -movflags +faststart "{out_path}"',
+            echo=False
+        )
     else:
-        filt=';'.join(parts_v+[f'{v_inputs}concat=n={len(windows)}:v=1:a=0[v]'])
-        run(f'ffmpeg -y -nostdin -loglevel error -i "{in_path}" -filter_complex "{filt}" -map "[v]" -an {vcodec_flags()} -movflags +faststart "{out_path}"', echo=False)
+        filt = ';'.join(
+            parts_v + [
+                f'{v_inputs}concat=n={len(windows)}:v=1:a=0[vcat]',
+                f'[vcat]setpts=PTS/{speed}[vout]'
+            ]
+        )
+        run(
+            f'ffmpeg -y -nostdin -loglevel error -i "{in_path}" '
+            f'-filter_complex "{filt}" -map "[vout]" '
+            f'{vcodec_flags()} -an -movflags +faststart "{out_path}"',
+            echo=False
+        )
 
-# ---------- speed up ----------
-def speed_up_final(in_path: str, out_path: str, speed=1.1):
-    if has_audio_stream(in_path):
-        run(f'ffmpeg -y -nostdin -loglevel error -i "{in_path}" -filter_complex "[0:v]setpts=PTS/{speed}[v];[0:a]atempo={speed}[a]" -map "[v]" -map "[a]" {vcodec_flags()} -c:a aac -b:a 192k -movflags +faststart "{out_path}"')
-    else:
-        run(f'ffmpeg -y -nostdin -loglevel error -i "{in_path}" -vf "setpts=PTS/{speed}" {vcodec_flags()} -an -movflags +faststart "{out_path}"')
+def extract_narration(input_video: str, out_m4a: str):
+    run(f'ffmpeg -y -nostdin -loglevel error -i "{input_video}" -vn -c:a aac -b:a 192k "{out_m4a}"', echo=False)
+
+# ================== PARALLEL HELPERS ==================
+def _do_asr(wav_path: Path):
+    return whisper_words(str(wav_path))
+
+def _make_alpha(input_video: Path, mov_out: Path):
+    fast_transparent_segment(str(input_video), str(mov_out), target_height=720, threshold=0.52)
+    return str(mov_out)
+
+def _preplan_segments(segments):
+    metas = []
+    last_first_clip = None
+    N = len(segments)
+    for i, p in enumerate(segments):
+        is_last = (i == N - 1)
+        place_right = (i % 2 == 0)  # deterministic side (RIGHT/LEFT alternate)
+        base_seq = []
+        chosen_folder_name = None
+
+        if not is_last:
+            hooks_mode = (i < 2)
+            folder = choose_broll_folder_for_index(i, N, p["text"], last_first_clip, hooks_mode)
+            dur = max(0.25, p["end"] - p["start"])
+            base_seq = plan_broll_sequence_in_folder(folder, dur, avoid_first=last_first_clip) if folder else []
+            if base_seq:
+                last_first_clip = base_seq[0][0]
+            chosen_folder_name = folder.name if folder else "None"
+
+        metas.append({
+            "start": p["start"], "end": p["end"], "text": p["text"],
+            "place_right": place_right,
+            "base_seq": base_seq,
+            "is_last": is_last,
+            "chosen_folder": chosen_folder_name,
+        })
+    return metas
+
+def _precompute_rel_chunks(metas, words):
+    for m in metas:
+        m["rel_chunks"] = build_audio_chunks_for_window(words, m["start"], m["end"])
+
+def _render_segment_job(seg_idx, seg_meta, input_video, trans_mov, W, H, fps, out_dir):
+    import tempfile
+    from pathlib import Path
+    seg_out = Path(out_dir) / f"{Path(input_video).stem}_seg_{seg_idx:03d}.mp4"
+    with tempfile.TemporaryDirectory() as td_sub:
+        ass_path = Path(td_sub) / "seg.ass"
+        write_centered_ass_chunks(seg_meta["rel_chunks"], ass_path)
+        if seg_meta.get("is_last", False):
+            ss = max(0.0, seg_meta["start"]); to = max(ss + 0.05, seg_meta["end"])
+            render_outro_with_subs(
+                out_path=str(seg_out),
+                input_video=str(input_video),
+                ss=ss, to=to, W=W, H=H, fps=fps,
+                ass_path=str(ass_path)
+            )
+        else:
+            base_seq = list(seg_meta.get("base_seq", []))
+            dur = max(0.25, seg_meta["end"] - seg_meta["start"])
+            if base_seq:
+                tot = sum(t for _, t in base_seq)
+                if abs(tot - dur) > 1e-3:
+                    p_last, t_last = base_seq[-1]
+                    base_seq[-1] = (p_last, max(0.1, t_last + (dur - tot)))
+            render_segment_single_call(
+                out_path=str(seg_out),
+                base_seq=base_seq,
+                person_mov=str(trans_mov),
+                seg_start=seg_meta["start"],
+                seg_end=seg_meta["end"],
+                place_right=seg_meta["place_right"],
+                out_size=(W, H), fps=fps,
+                ass_path=str(ass_path)
+            )
+    return str(seg_out.resolve())
 
 # ---------- transparent person maker ----------
 def fast_transparent_segment(input_path: str, output_mov: str, target_height: int = 720, threshold: float = 0.52,
@@ -631,9 +760,8 @@ def normalize_greenscreen_filenames(gs_dir: Path, scripts_dir: Path) -> dict:
         try:
             p.rename(target)
             renames[str(p)] = str(target)
-            log(f"🔤 tagged: {p.name} → {target.name}")
-        except Exception as e:
-            log(f"❌ rename failed for {p.name}: {e}")
+        except Exception:
+            pass
     return renames
 
 # ---------- discovery ----------
@@ -681,115 +809,107 @@ def clean_output_dir(out_dir: Path):
         except Exception:
             pass
 
-# ---------- per-video processing ----------
+# ---------- per-video processing (parallelized) ----------
 def process_one(input_video: Path, script_txt: Path):
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     stem = input_video.stem
-    W,H,fps,_ = ffprobe_stream(str(input_video))
+    W, H, fps, _ = ffprobe_stream(str(input_video))
 
-    # extract audio → words
+    log_step(f"VIDEO: {input_video.name}")
+
+    # 1) Extract audio WAV
     raw_audio = OUT_DIR / f"{stem}_raw.wav"
-    log(f"🎧 extracting audio… ({input_video.name})")
+    log_step("AUDIO: extract WAV")
     extract_audio_to_wav(str(input_video), raw_audio)
-    log("🗣️ transcribing…")
-    words = whisper_words(str(raw_audio))
 
-    # script → windows
+    # 2) Overlap ASR and Alpha-MOV creation (if MOV doesn't exist yet)
+    trans_mov = OUT_DIR / f"{stem}_no_bg.mov"
+    asr_words = None
+
+    if trans_mov.exists():
+        log_step("ASR: transcribing")
+        asr_words = whisper_words(str(raw_audio))
+    else:
+        log_step("PARALLEL: ASR + ALPHA MOV")
+        with ProcessPoolExecutor(max_workers=2) as ex:
+            fut_asr = ex.submit(_do_asr, raw_audio)
+            fut_mov = ex.submit(_make_alpha, input_video, trans_mov)
+            asr_words = fut_asr.result()
+            _ = fut_mov.result()
+
+    words = asr_words
+
+    # 3) Script → segments
     script_text = Path(script_txt).read_text(encoding="utf-8")
     script_sent = split_sentences_period(script_text)
     assert script_sent, f"No sentences in script {script_txt}."
     segments = build_segments_from_script(words, script_sent)
-    log(f"built {len(segments)} segments for {stem}")
+    log_step(f"ALIGN: {len(segments)} segments")
 
-    # transparent person (cache per video)
-    trans_mov = OUT_DIR / f"{stem}_no_bg.mov"
-    if not trans_mov.exists():
-        log("🎨 making transparent person MOV… (first run only)")
-        fast_transparent_segment(str(input_video), str(trans_mov), target_height=720, threshold=0.52)
+    # 4) Pre-plan + precompute subtitles
+    metas = _preplan_segments(segments)
+    _precompute_rel_chunks(metas, words)
 
-    # render segments
-    seg_files=[]; alt_right=True; last_first_clip=None
-    N = len(segments)
-    for i,p in enumerate(segments):
-        seg_out = OUT_DIR / f"{stem}_seg_{i:03d}.mp4"
-        dur = max(0.25, p["end"]-p["start"])
+    # 5) Kick off narration extraction in parallel with segment renders
+    narration = OUT_DIR / f"{stem}_narration.m4a"
+    seg_paths = [None] * len(metas)
+    log_step(f"RENDER: {len(metas)} segments (workers={SEG_RENDER_WORKERS})")
+    with ProcessPoolExecutor(max_workers=max(1, SEG_RENDER_WORKERS)) as ex:
+        fut_narr = ex.submit(extract_narration, str(input_video), str(narration))
+        futs = {
+            ex.submit(_render_segment_job, i, metas[i], str(input_video), str(trans_mov), W, H, fps, str(OUT_DIR)): i
+            for i in range(len(metas))
+        }
+        for fut in as_completed(futs):
+            idx = futs[fut]
+            seg_paths[idx] = fut.result()
+            log_step(f"RENDER: segment {idx:03d} done")
+        fut_narr.result()
 
-        with tempfile.TemporaryDirectory() as td_sub:
-            ass_path = Path(td_sub)/"seg.ass"
-            rel_chunks = build_audio_chunks_for_window(words, p["start"], p["end"])
-            write_centered_ass_chunks(rel_chunks, ass_path)
-
-            if i == N-1:
-                ss = max(0.0, p["start"]); to = max(ss + 0.05, p["end"])
-                log(f"🎬 {stem} seg {i:03d} OUTRO fullscreen (ss={ss:.3f}, to={to:.3f})")
-                render_outro_with_subs(str(seg_out), str(input_video), ss, to, W, H, fps, ass_path)
-            else:
-                hooks_mode = (i < 2)
-                folder = choose_broll_folder_for_index(i, N, p["text"], last_first_clip, hooks_mode)
-                base_seq = plan_broll_sequence_in_folder(folder, dur, avoid_first=last_first_clip) if folder else []
-                if base_seq:
-                    last_first_clip = base_seq[0][0]
-                tot = sum(t for _,t in base_seq) if base_seq else 0.0
-                if base_seq and abs(tot - dur) > 1e-3:
-                    p_last, t_last = base_seq[-1]
-                    base_seq[-1] = (p_last, max(0.1, t_last + (dur - tot)))
-                render_segment_single_call(
-                    out_path=str(seg_out),
-                    base_seq=base_seq,
-                    person_mov=str(trans_mov),
-                    seg_start=p["start"], seg_end=p["end"],
-                    place_right=alt_right,
-                    out_size=(W,H), fps=fps,
-                    ass_path=ass_path
-                )
-                label = "HOOK_BODY" if i < 2 else "BODY"
-                chosen_folder_name = folder.name if folder else "None"
-                log(f"🎬 {stem} seg {i:03d} {label} folder={chosen_folder_name} side={'RIGHT' if alt_right else 'LEFT'} {p['start']:.2f}→{p['end']:.2f}")
-                alt_right = not alt_right
-
-        seg_files.append(seg_out)
-
-    # concat (stream copy)
+    # 6) Concat in-order
+    log_step("CONCAT: join segments")
     concat_txt = OUT_DIR / f"{stem}_concat_list.txt"
     with open(concat_txt,"w") as f:
-        for s in seg_files: f.write(f"file '{s.resolve().as_posix()}'\n")
+        for p in seg_paths:
+            f.write(f"file '{Path(p).as_posix()}'\n")
     concat = OUT_DIR / f"{stem}_concat.mp4"
     run(f'ffmpeg -y -nostdin -loglevel error -f concat -safe 0 -i "{concat_txt}" -c copy -movflags +faststart "{concat}"')
 
-    # narration (from original) + mux
-    narration = OUT_DIR / f"{stem}_narration.m4a"
-    run(f'ffmpeg -y -nostdin -loglevel error -i "{input_video}" -vn -c:a aac -b:a 192k "{narration}"')
+    # 7) Mux narration
+    log_step("MUX: add narration")
     muxed = OUT_DIR / f"{stem}_muxed.mp4"
     run(f'ffmpeg -y -nostdin -loglevel error -i "{concat}" -i "{narration}" -map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -b:a 192k -shortest -movflags +faststart "{muxed}"')
 
-    # clamp silences
-    clamped = OUT_DIR / f"{stem}_clamped.mp4"
-    log("🔇 clamping long silences to 0.15s…")
-    shrink_silences_keep(str(muxed), str(clamped), min_silence=MIN_SILENCE_SEC, keep_silence=KEEP_SILENCE_SEC, noise_db=SILENCE_NOISE_DB)
-
-    # final speed
+    # 8) Clamp + Speed (one pass)
     final_out = OUT_DIR / f"{stem}_FINAL.mp4"
-    log(f"⏩ applying global {FINAL_SPEED}x speed…")
-    speed_up_final(str(clamped), str(final_out), speed=FINAL_SPEED)
+    log_step(f"FINALIZE: clamp={KEEP_SILENCE_SEC:.2f}s speed={FINAL_SPEED}x")
+    clamp_and_speed(
+        in_path=str(muxed),
+        out_path=str(final_out),
+        speed=FINAL_SPEED,
+        min_silence=MIN_SILENCE_SEC,
+        keep_silence=KEEP_SILENCE_SEC,
+        noise_db=SILENCE_NOISE_DB
+    )
 
-    # move final → final dir and clean OUT_DIR
+    # 9) Move final → final dir and clean OUT_DIR
     dest = move_to_final(final_out, FINAL_VIDS_DIR)
-    log(f"📦 moved final → {dest}")
+    log_step(f"OUTPUT: {dest.name}")
     clean_output_dir(OUT_DIR)
-    log("🧹 cleaned output_split/")
+    log_step("CLEAN: scratch")
 
     return dest
 
-# ---------- batch runner (simple all-in-one) ----------
+# ---------- batch runner (video-level parallel optional) ----------
 def main():
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     FINAL_VIDS_DIR.mkdir(parents=True, exist_ok=True)
 
-    # 1) Normalize filenames in greenscreen (tag with NUMBER when script exists)
+    # Normalize filenames (quiet)
     normalize_greenscreen_filenames(GREENSCREEN_DIR, SCRIPTS_DIR)
 
-    # 2) Discover all processable (video, matching script)
+    # Discover
     pairs = find_processable_videos(GREENSCREEN_DIR, SCRIPTS_DIR)
     if not pairs:
         gs_list = [p.name for p in GREENSCREEN_DIR.iterdir()] if GREENSCREEN_DIR.exists() else []
@@ -804,11 +924,16 @@ def main():
             "and scripts/<NUM>.txt exists."
         )
 
-    # 3) Process all
-    results=[]
-    for v, s in pairs:
-        log(f"📦 processing: video={v.name} script={s.name}")
-        results.append(str(process_one(v, s)))
+    results = []
+    if VIDEO_WORKERS <= 1:
+        for v, s in pairs:
+            results.append(str(process_one(v, s)))
+    else:
+        log_step(f"BATCH: {len(pairs)} videos (workers={VIDEO_WORKERS})")
+        with ProcessPoolExecutor(max_workers=VIDEO_WORKERS) as ex:
+            futs = {ex.submit(process_one, v, s): (v, s) for (v, s) in pairs}
+            for fut in as_completed(futs):
+                results.append(str(fut.result()))
 
     print(json.dumps({"finals": results}, indent=2))
 
