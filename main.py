@@ -69,7 +69,7 @@ VIDEO_WORKERS        = int(os.getenv("VIDEO_WORKERS", "1"))        # videos in b
 # ---------- logging / exec ----------
 _t0 = time.time()
 def log_step(step: str):
-    print(f"[{time.time()-_t0:7.2f}s] {step}")
+    print(f"[{time.time()-_t0:7.2f}s] {step}", flush=True)
 
 # Alias to keep any legacy log(...) calls quiet and consistent
 log = log_step
@@ -251,10 +251,11 @@ def write_centered_ass_chunks(chunks, out_ass_path, font="Arial", size=64, outli
         "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
     with open(out_ass_path, "w", encoding="utf-8") as f:
-        f.write(header)
+        for_write = [header]
         for c in chunks:
             safe = c["text"].replace("{","(").replace("}",")")
-            f.write(f"Dialogue: 0,{ts(c['start'])},{ts(c['end'])},TikTok,,0,0,0,,{safe}\n")
+            for_write.append(f"Dialogue: 0,{ts(c['start'])},{ts(c['end'])},TikTok,,0,0,0,,{safe}\n")
+        f.writelines(for_write)
 
 def split_chunks_by_limits_words(words_list, max_chars=26, max_words=6, min_chunk_dur=0.25):
     chunks=[]; cur_tokens=[]; cur_start=None; last_end=None
@@ -389,54 +390,93 @@ def plan_broll_sequence_in_folder(folder: Path, need_sec: float, avoid_first: Pa
 
 # ---------- renderers ----------
 def render_segment_single_call(out_path, base_seq, person_mov, seg_start, seg_end, place_right, out_size, fps, ass_path=None):
-    W,H = out_size
-    cmd = ["ffmpeg","-y","-nostdin","-loglevel","error"]
-    idx = 0; base_labels=[]
+    W, H = out_size
+    cmd = ["ffmpeg", "-y", "-nostdin", "-loglevel", "error"]
+    idx = 0
+    base_labels = []
 
+    # 1) Inputs
     if not base_seq:
-        need_t = max(0.25, seg_end-seg_start)
-        cmd += ["-f","lavfi","-t",f"{need_t:.6f}","-i",f"color=c=black:s={W}x{H}:r={fps:.2f}"]
-        base_labels.append((idx, need_t, True, True)); idx += 1
+        # black base
+        need_t = max(0.25, seg_end - seg_start)
+        cmd += ["-f", "lavfi", "-t", f"{need_t:.6f}", "-i", f"color=c=black:s={W}x{H}:r={fps:.2f}"]
+        base_labels.append((idx, need_t, True, True))
+        idx += 1
     else:
         for src, play_t in base_seq:
             play_t = max(0.1, float(play_t))
             if is_image(src):
-                cmd += ["-loop","1","-t",f"{play_t:.6f}","-i",str(src)]
+                # images: loop and give exact duration to create a real stream
+                cmd += ["-loop", "1", "-t", f"{play_t:.6f}", "-i", str(src)]
                 base_labels.append((idx, play_t, True, False))
             else:
                 cmd += ["-i", str(src)]
                 base_labels.append((idx, play_t, False, False))
             idx += 1
 
+    # person (foreground with alpha)
     cmd += ["-i", str(person_mov)]
     person_idx = idx
 
-    chains=[]; outs=[]
+    # 2) Filters
+    chains = []
+    outs = []
+
+    # Normalize every base branch to W×H, **square SAR**, and common FPS
     for (i, play_t, is_img, is_black) in base_labels:
-        ops=[]
+        ops = []
         if not is_black:
-            ops += [f"fps={fps:.2f}", f"scale={W}:{H}:force_original_aspect_ratio=decrease", f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2"]
+            # videos/images → letterbox to target, then force SAR=1 and fps
+            ops += [
+                f"scale={W}:{H}:force_original_aspect_ratio=decrease",
+                f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2",
+                "setsar=1",
+                f"fps={fps:.2f}",
+            ]
+        else:
+            # solid color already W×H but keep SAR and fps consistent
+            ops += ["setsar=1", f"fps={fps:.2f}"]
+
+        # trim to requested play time and reset pts
         ops += [f"trim=end={play_t:.6f}", "setpts=PTS-STARTPTS"]
-        chains.append(f"[{i}:v]{','.join(ops)}[bb{i}]"); outs.append(f"[bb{i}]")
 
-    base_out = outs[0] if len(outs)==1 else "".join(outs)+f"concat=n={len(outs)}:v=1:a=0[base]"
-    if len(outs)>1: chains.append(base_out); base_out="[base]"
+        chains.append(f"[{i}:v]{','.join(ops)}[bb{i}]")
+        outs.append(f"[bb{i}]")
 
-    start_t=max(0.0, seg_start); end_t=max(start_t+0.25, seg_end)
-    chains.append(f"[{person_idx}:v]trim=start={start_t:.6f}:end={end_t:.6f},setpts=PTS-STARTPTS,format=rgba,scale=iw*1.0:-1:flags=bicubic,format=rgba[fg]")
+    # Concat (if multiple base clips)
+    if len(outs) == 1:
+        base_out = outs[0]
+    else:
+        chains.append("".join(outs) + f"concat=n={len(outs)}:v=1:a=0[basecat]")
+        # after concat, be explicit again: square SAR + fps
+        chains.append(f"[basecat]setsar=1,fps={fps:.2f}[base]")
+        base_out = "[base]"
 
+    # Foreground person: trim to window, ensure **square SAR** + RGBA for overlay
+    start_t = max(0.0, seg_start)
+    end_t = max(start_t + 0.25, seg_end)
+    chains.append(
+        f"[{person_idx}:v]"
+        f"trim=start={start_t:.6f}:end={end_t:.6f},setpts=PTS-STARTPTS,"
+        f"scale=iw*1.0:-1:flags=bicubic,setsar=1,format=rgba[fg]"
+    )
+
+    # Overlay (keep SAR consistent afterwards, too)
     x_expr = f"W-w-0" if place_right else "0"
     y_expr = f"H-h-0"
     chains.append(f"{base_out}[fg]overlay=x={x_expr}:y={y_expr}:format=auto:eval=frame[vv]")
+    chains.append(f"[vv]setsar=1[vv2]")  # final guard
 
-    map_video="[vv]"
+    # Optional subtitles on top of overlay
+    map_video = "[vv2]"
     if ass_path:
-        ass = Path(ass_path).as_posix().replace("\\","/")
-        chains.append(f"[vv]subtitles='{ass}'[vout]")
-        map_video="[vout]"
+        ass = Path(ass_path).as_posix().replace("\\", "/")
+        chains.append(f"{map_video}subtitles='{ass}'[vout]")
+        map_video = "[vout]"
 
-    cmd += ["-filter_complex",";".join(chains),"-map",map_video,"-an"]
-    cmd += vcodec_flags().split(); cmd += [str(out_path)]
+    cmd += ["-filter_complex", ";".join(chains), "-map", map_video, "-an"]
+    cmd += vcodec_flags().split()
+    cmd += [str(out_path)]
     run(" ".join(shlex.quote(c) for c in cmd), echo=False)
 
 def render_outro_with_subs(out_path, input_video, ss, to, W, H, fps, ass_path):
@@ -893,9 +933,14 @@ def process_one(input_video: Path, script_txt: Path):
         noise_db=SILENCE_NOISE_DB
     )
 
-    # 9) Move final → final dir and clean OUT_DIR
+    # 9) Move final → final dir (run_farm.py will upload & archive)
     dest = move_to_final(final_out, FINAL_VIDS_DIR)
     log_step(f"OUTPUT: {dest.name}")
+
+    # 10) Upload is handled by run_farm.py (no-op here)
+    log_step("UPLOAD: skipped (handled by run_farm.py)")
+
+    # 11) Clean OUT_DIR scratch
     clean_output_dir(OUT_DIR)
     log_step("CLEAN: scratch")
 
