@@ -423,27 +423,25 @@ def render_segment_single_call(out_path, base_seq, person_mov, seg_start, seg_en
     outs = []
 
     # Normalize every base branch to W×H, **square SAR**, and common FPS
+    TARGET_W, TARGET_H = 1080, 1440
     for (i, play_t, is_img, is_black) in base_labels:
         ops = []
         if not is_black:
-            # videos/images → letterbox to target, then force SAR=1 and fps
+            # keep full image visible; add padding if needed
             ops += [
-                f"scale={W}:{H}:force_original_aspect_ratio=decrease",
-                f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2",
+                f"scale='if(gt(a,{TARGET_W}/{TARGET_H}),{TARGET_W},-1)':'if(gt(a,{TARGET_W}/{TARGET_H}),-1,{TARGET_H})':force_original_aspect_ratio=decrease",
+                f"pad={TARGET_W}:{TARGET_H}:(ow-iw)/2:(oh-ih)/2:black",
                 "setsar=1",
                 f"fps={fps:.2f}",
             ]
         else:
-            # solid color already W×H but keep SAR and fps consistent
             ops += ["setsar=1", f"fps={fps:.2f}"]
 
         # trim to requested play time and reset pts
         ops += [f"trim=end={play_t:.6f}", "setpts=PTS-STARTPTS"]
-
         chains.append(f"[{i}:v]{','.join(ops)}[bb{i}]")
         outs.append(f"[bb{i}]")
 
-    # Concat (if multiple base clips)
     if len(outs) == 1:
         base_out = outs[0]
     else:
@@ -670,7 +668,8 @@ def _render_segment_job(seg_idx, seg_meta, input_video, trans_mov, W, H, fps, ou
                 seg_start=seg_meta["start"],
                 seg_end=seg_meta["end"],
                 place_right=seg_meta["place_right"],
-                out_size=(W, H), fps=fps,
+                out_size=(1080, 1440),
+                fps=fps,
                 ass_path=str(ass_path)
             )
     return str(seg_out.resolve())
